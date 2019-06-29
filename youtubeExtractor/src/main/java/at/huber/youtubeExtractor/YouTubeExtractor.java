@@ -74,6 +74,7 @@ public abstract class YouTubeExtractor extends AsyncTask<String, Void, SparseArr
     private static final Pattern patChannelId = Pattern.compile("ucid=(.+?)(&|\\z)");
     private static final Pattern patLength = Pattern.compile("length_seconds=(\\d+?)(&|\\z)");
     private static final Pattern patViewCount = Pattern.compile("view_count=(\\d+?)(&|\\z)");
+    private static final Pattern patStatusOk = Pattern.compile("status=ok(&|,|\\z)");
 
     private static final Pattern patHlsvp = Pattern.compile("hlsvp=(.+?)(&|\\z)");
     private static final Pattern patHlsItag = Pattern.compile("/itag/(\\d+?)/");
@@ -81,13 +82,15 @@ public abstract class YouTubeExtractor extends AsyncTask<String, Void, SparseArr
     private static final Pattern patItag = Pattern.compile("itag=([0-9]+?)([&,])");
     private static final Pattern patEncSig = Pattern.compile("s=([0-9A-F|.]{10,}?)([&,\"])");
     private static final Pattern patIsSigEnc = Pattern.compile("s%3D([0-9A-F|.]{10,}?)(%26|%2C)");
-    private static final Pattern patUrl = Pattern.compile("url=(.+?)([&,])");
+    private static final Pattern patEncSig2 = Pattern.compile("(\\A|&|\")s=([0-9A-Za-z\\-_=%]{10,}?)([&,\"])");
+    private static final Pattern patIsSigEnc2 = Pattern.compile("(%26|%3F|%2C)s%3D([0-9A-Za-z\\-_=%]{10,}?)(%26|%2C|\\z)");
+    private static final Pattern patUrl = Pattern.compile("url=(.+?)([&,\"])");
 
     private static final Pattern patVariableFunction = Pattern.compile("([{; =])([a-zA-Z$][a-zA-Z0-9$]{0,2})\\.([a-zA-Z$][a-zA-Z0-9$]{0,2})\\(");
     private static final Pattern patFunction = Pattern.compile("([{; =])([a-zA-Z$_][a-zA-Z0-9$]{0,2})\\(");
   
     private static final Pattern patDecryptionJsFile = Pattern.compile("jsbin\\\\/(player(_ias)?-(.+?).js)");
-    private static final Pattern patSignatureDecFunction = Pattern.compile("(\\w+)\\s*=\\s*function\\((\\w+)\\).\\s*\\2=\\s*\\2\\.split\\(\"\"\\)\\s*;");
+    private static final Pattern patSignatureDecFunction = Pattern.compile("([\\w$]+)\\s*=\\s*function\\(([\\w$]+)\\).\\s*\\2=\\s*\\2\\.split\\(\"\"\\)\\s*;");
 
     private static final SparseArray<Format> FORMAT_MAP = new SparseArray<>();
 
@@ -276,22 +279,28 @@ public abstract class YouTubeExtractor extends AsyncTask<String, Void, SparseArr
 
         // "use_cipher_signature" disappeared, we check whether at least one ciphered signature
         // exists int the stream_map.
-        boolean sigEnc = true;
+        boolean sigEnc = true, statusFail = false;
         if(streamMap != null && streamMap.contains(STREAM_MAP_STRING)){
-            String streamMapSub = streamMap.substring(streamMap.indexOf(STREAM_MAP_STRING));
-            mat = patIsSigEnc.matcher(streamMapSub);
-            if(!mat.find())
+
+            if(!patIsSigEnc2.matcher(streamMap).find() && !patIsSigEnc.matcher(streamMap).find()) {
                 sigEnc = false;
+
+                if (!patStatusOk.matcher(streamMap).find())
+                    statusFail = true;
+            }
         }
 
         // Some videos are using a ciphered signature we need to get the
         // deciphering js-file from the youtubepage.
-        if (sigEnc) {
+        if (sigEnc || statusFail) {
             // Get the video directly from the youtubepage
             if (CACHING
                     && (decipherJsFileName == null || decipherFunctions == null || decipherFunctionName == null)) {
                 readDecipherFunctFromCache();
             }
+            if (LOGGING)
+                Log.d(LOG_TAG, "Get from youtube page");
+
             getUrl = new URL("https://youtube.com/watch?v=" + videoID);
             urlConnection = (HttpURLConnection) getUrl.openConnection();
             urlConnection.setRequestProperty("User-Agent", USER_AGENT);
@@ -346,6 +355,7 @@ public abstract class YouTubeExtractor extends AsyncTask<String, Void, SparseArr
             streamMap = URLDecoder.decode(streamMap, "UTF-8");
         }
 
+        boolean oldSignature = false;
         streams = streamMap.split(",|"+STREAM_MAP_STRING+"|&adaptive_fmts=");
         SparseArray<YtFile> ytFiles = new SparseArray<>();
         for (String encStream : streams) {
@@ -374,9 +384,16 @@ public abstract class YouTubeExtractor extends AsyncTask<String, Void, SparseArr
             }
 
             if (curJsFileName != null) {
-                mat = patEncSig.matcher(stream);
+                mat = patEncSig2.matcher(stream);
                 if (mat.find()) {
-                    encSignatures.append(itag, mat.group(1));
+                    encSignatures.append(itag, URLDecoder.decode(mat.group(2), "UTF-8"));
+                } else {
+                    mat = patEncSig.matcher(stream);
+                    if (mat.find())
+                    {
+                        encSignatures.append(itag, mat.group(1));
+                        oldSignature = true;
+                    }
                 }
             }
             mat = patUrl.matcher(encStream);
@@ -394,6 +411,7 @@ public abstract class YouTubeExtractor extends AsyncTask<String, Void, SparseArr
         }
 
         if (encSignatures != null) {
+
             if (LOGGING)
                 Log.d(LOG_TAG, "Decipher signatures: " + encSignatures.size()+ ", videos: " + ytFiles.size());
             String signature;
@@ -417,7 +435,7 @@ public abstract class YouTubeExtractor extends AsyncTask<String, Void, SparseArr
                         dashMpdUrl = dashMpdUrl.replace("/s/" + encSignatures.get(key), "/signature/" + sigs[i]);
                     } else {
                         String url = ytFiles.get(key).getUrl();
-                        url += "&signature=" + sigs[i];
+                        url += (oldSignature ? "&signature=" : "&sig=") + sigs[i];
                         YtFile newFile = new YtFile(FORMAT_MAP.get(key), url);
                         ytFiles.put(key, newFile);
                     }
@@ -567,7 +585,8 @@ public abstract class YouTubeExtractor extends AsyncTask<String, Void, SparseArr
     }
 
     private void parseDashManifest(String dashMpdUrl, SparseArray<YtFile> ytFiles) throws IOException {
-        Pattern patBaseUrl = Pattern.compile("<BaseURL yt:contentLength=\"[0-9]+?\">(.+?)</BaseURL>");
+        Pattern patBaseUrl = Pattern.compile("<\\s*BaseURL(.*?)>(.+?)<\\s*/BaseURL\\s*>");
+        Pattern patDashItag = Pattern.compile("itag/([0-9]+?)/");
         String dashManifest;
         BufferedReader reader = null;
         URL getUrl = new URL(dashMpdUrl);
@@ -588,8 +607,8 @@ public abstract class YouTubeExtractor extends AsyncTask<String, Void, SparseArr
         Matcher mat = patBaseUrl.matcher(dashManifest);
         while (mat.find()) {
             int itag;
-            String url = mat.group(1);
-            Matcher mat2 = patItag.matcher(url);
+            String url = mat.group(2);
+            Matcher mat2 = patDashItag.matcher(url);
             if (mat2.find()) {
                 itag = Integer.parseInt(mat2.group(1));
                 if (FORMAT_MAP.get(itag) == null)
@@ -599,13 +618,9 @@ public abstract class YouTubeExtractor extends AsyncTask<String, Void, SparseArr
             } else {
                 continue;
             }
-            url = url.replace("&amp;", "&").replace(",", "%2C").
-                    replace("mime=audio/", "mime=audio%2F").
-                    replace("mime=video/", "mime=video%2F");
             YtFile yf = new YtFile(FORMAT_MAP.get(itag), url);
             ytFiles.append(itag, yf);
         }
-
     }
 
     private void parseVideoMeta(String getVideoInfo) throws UnsupportedEncodingException {
